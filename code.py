@@ -292,6 +292,58 @@ class Account:
         self.record_operation("cash_deposit", amount, context)
 
 
+    def risk_of_card_purchase(
+        self,
+        risk_flags: list[bool],
+        amount: int,
+        merchant_id: int,
+        context: OperationContext,
+    ) -> int:
+    # При реализации сравнивайте покупку с self.operation_history
+        raise NotImplementedError
+
+
+    def card_purchase(
+        self,
+        amount: int,
+        merchant_id: int,
+        context: OperationContext,
+    ) -> None:
+        ensure_new_operation(context)
+        data_of_operations.add(context.operation_id)
+        if context.channel != "CARD":
+            self.record_operation(
+                "card_purchase", amount, context, merchant_id, status="blocked"
+            )
+            raise ValueError("покупка должна проходить по каналу CARD")
+        if amount <= 0:
+            self.record_operation(
+                "card_purchase", amount, context, merchant_id, status="blocked"
+            )
+            raise ValueError("сумма должна быть положительной")
+        if amount > self.balance:
+            self.record_operation(
+                "card_purchase", amount, context, merchant_id, status="blocked"
+            )
+            raise BankException("недостаточно средств")
+        risk_flags = [
+            context.device_id in data_of_susp_devices,
+            context.payment_network_risk,
+        ]
+        risk = self.risk_of_card_purchase(risk_flags, amount, merchant_id, context)
+        self.anx_ind += risk
+        if self.anx_ind >= risk_threshold:
+            self.record_operation(
+                "card_purchase", amount, context, merchant_id, status="blocked"
+            )
+            raise BankException("покупка по карте заблокирована")
+        self.balance -= amount
+        self.sum_per_day[-1] += amount
+        self.record_operation(
+            "card_purchase", amount, context, merchant_id, status="completed"
+        )
+
+
     def end_of_the_day(self):
         self.average_pay_per_day = sum(self.sum_per_day) // len(self.sum_per_day)
         self.sum_per_day.append(0)
