@@ -2,14 +2,65 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import chain
+from statistics import median
 
 data_of_susp_acc: set[int] = set()
 data_of_susp_devices: set[int] = set()
 data_of_acc: dict[int, list["Account"]] = {}
 data_of_operations: set[int] = set()
 last_fin_events: dict[int, datetime] = {}
-risk_threshold: int
-susp_threshold: int
+risk_threshold: int = 60
+susp_threshold: int = 60
+MAX_INDEX: int = 100
+
+
+# Порядок флагов должен совпадать с тем, как они заполняются в transfer.
+TRANSFER_WEIGHTS = (
+    100,  # получатель есть в подтверждённом списке мошеннических клиентов
+    100,  # устройство есть в подтверждённом списке
+    30,   # внешний сигнал о подозрительной активности за 6 часов
+    15,   # изменение данных за 48 часов
+    45,   # предупреждение платёжной инфраструктуры по этой операции
+    45,   # полный триггер: крупный собственный СБП и новый физлицо-получатель
+    30,   # индекс подозрительности получателя достиг порога
+)
+
+# Порядок флагов должен совпадать с withdrawing.
+WITHDRAWAL_WEIGHTS = (
+    30,   # внешний сигнал за 6 часов
+    15,   # изменение данных за 48 часов
+    45,   # предупреждение инфраструктуры по этой операции
+    40,   # недавнее подходящее финансовое событие или собственный СБП
+    30,   # пять и более предыдущих отказов в снятии за день
+    50,   # превышена техническая норма APDU для банкомата
+    100,  # подтверждённое мошенническое устройство
+)
+
+TOP_UP_WEIGHTS = (
+    45,   # предупреждение инфраструктуры по этой операции
+    50,   # превышена техническая норма APDU
+    100,  # подтверждённое мошенническое устройство
+)
+
+CARD_WEIGHTS = (
+    100,  # подтверждённое мошенническое устройство
+    45,   # предупреждение инфраструктуры по этой покупке
+)
+
+
+def score_flags(flags: list[bool], weights: tuple[int, ...]) -> int:
+    if len(flags) != len(weights):
+        raise ValueError("число флагов не совпадает с числом весов")
+
+    return min(
+        MAX_INDEX,
+        sum(weight for flag, weight in zip(flags, weights) if flag),
+    )
+
+
+def add_index_points(current: int, points: int) -> int:
+    """Не позволяет индексу выйти за диапазон 0–100."""
+    return min(MAX_INDEX, max(0, current + points))
 
 
 class BankException(Exception):
@@ -108,6 +159,50 @@ class Account:
         )
 
 
+    def _amount_anomaly_points(
+        self,
+        kind: str,
+        amount: int,
+        context: OperationContext,
+            peer_id: int | None = None,
+    ) -> int:
+        cutoff = context.occurred_at - timedelta(days=30)
+
+        history = [
+            record
+            for record in self.operation_history
+            if record.kind == kind
+            and record.status == "completed"
+            and record.amount > 0
+            and cutoff <= record.context.occurred_at < context.occurred_at
+        ]
+
+        # Если с этим получателем или продавцом было не меньше пяти операций,
+        # сравниваем сумму именно с ними. Иначе — со всеми операциями этого типа.
+        peer_history = [
+            record for record in history
+            if peer_id is not None and record.counterparty_id == peer_id
+        ]
+        baseline_records = peer_history if len(peer_history) >= 5 else history
+
+        if len(baseline_records) < 5:
+            return 0
+
+        typical_amount = median(record.amount for record in baseline_records)
+        if typical_amount <= 0:
+            return 0
+
+        ratio = amount / typical_amount
+
+        if ratio >= 10:
+            return 15
+        if ratio >= 5:
+            return 10
+        if ratio >= 3:
+            return 5
+        return 0
+
+
     def had_recent_relation(self, person_id: int, now: datetime) -> bool:
         cutoff = now - timedelta(days=180)
         dates = (
@@ -117,12 +212,16 @@ class Account:
         return any(date is not None and cutoff <= date <= now for date in dates)
 
 
-    def risk_of_transfer(self, risk_flags: list[bool], sum: int) -> int:
-        raise NotImplementedError
+    def risk_of_transfer(self, risk_flags: list[bool], amount: int, context: OperationContext) -> int:
+        flags_score = score_flags(risk_flags, TRANSFER_WEIGHTS)
+        amount_score = self._amount_anomaly_points("transfer_out", amount, context)
+        return min(MAX_INDEX, flags_score + amount_score)
 
 
     def risk_of_drop(self, in_data_of_susp_acc: bool) -> int:
-        raise NotImplementedError
+        # Список ведётся вручную только для подтверждённых случаев.
+        # Это сильный сигнал, а не постепенная оценка поведения.
+        return 100 if in_data_of_susp_acc else 0
     
 
     def transfer(self, other: "Account", amount: int, context: OperationContext):
@@ -164,10 +263,10 @@ class Account:
             risk_flags[5] = True
         if other.susp_ind >= susp_threshold:
             risk_flags[6] = True
-        risk = self.risk_of_transfer(risk_flags, amount)
-        self.anx_ind += risk
+        risk = self.risk_of_transfer(risk_flags, amount, context)
+        self.anx_ind = add_index_points(self.anx_ind, risk)
         drop_risk = other.risk_of_drop(other.id in data_of_susp_acc)
-        other.susp_ind += drop_risk
+        other.susp_ind = add_index_points(other.susp_ind, drop_risk)
         if self.anx_ind >= risk_threshold:
             self.record_operation("transfer_out", amount, context, other.id, status="blocked")
             other.record_operation("transfer_in", amount, context, self.id, status="blocked")
@@ -192,8 +291,12 @@ class Account:
             self.last_big_cross_boarder_pay = now
 
 
-    def withdrawing_risk(self, risk_flags: list[bool], amount: int) -> int:
-        raise NotImplementedError
+    def withdrawing_risk(self, risk_flags: list[bool], amount: int, context: OperationContext) -> int:
+        flags_score = score_flags(risk_flags, WITHDRAWAL_WEIGHTS)
+        amount_score = self._amount_anomaly_points(
+            "cash_withdrawal", amount, context
+        )
+        return min(MAX_INDEX, flags_score + amount_score)
     
 
     def withdrawing(self, amount: int, pin: str, context: OperationContext):  # снятие через банкомат
@@ -235,8 +338,8 @@ class Account:
         risk_flags[5] = has_apdu_risk(context)
         if context.device_id in data_of_susp_devices:
             risk_flags[6] = True
-        risk = self.withdrawing_risk(risk_flags, amount)
-        self.anx_ind += risk
+        risk = self.withdrawing_risk(risk_flags, amount, context)
+        self.anx_ind = add_index_points(self.anx_ind, risk)
         drop_risk = self.risk_of_drop(self.id in data_of_susp_acc)
         self.susp_ind += drop_risk
         if self.anx_ind >= risk_threshold:
@@ -250,12 +353,24 @@ class Account:
         self.sum_per_day[-1] += amount
 
 
-    def drop_risk_in_top_up(self, sum: int):
-        raise NotImplementedError
+    def drop_risk_in_top_up(self):
+        # Метод вызывается только если уже выполнено всё составное условие:
+        # физлицо + токенизированная карта + перевод физлицу за границу
+        # более 100 000 ₽ в предыдущие 24 часа.
+        return 60
 
 
-    def risk_in_top_up(self, sum: int, context: OperationContext):
-        raise NotImplementedError
+    def risk_in_top_up(self, amount: int, context: OperationContext):
+        flags = [
+            context.payment_network_risk,
+            has_apdu_risk(context),
+            context.device_id in data_of_susp_devices,
+        ]
+        flags_score = score_flags(flags, TOP_UP_WEIGHTS)
+        amount_score = self._amount_anomaly_points(
+            "cash_deposit", amount, context
+        )
+        return min(MAX_INDEX, flags_score + amount_score)
 
 
     def top_up(self, amount: int, pin: str, is_tokenize: bool, context: OperationContext):    # пополнение через банкомат
@@ -271,7 +386,9 @@ class Account:
         if pin != self.pin:
             self.record_operation("cash_deposit", amount, context, status="blocked")
             raise BankException("неверный пин-код")
-        self.anx_ind += self.risk_in_top_up(amount, context)
+        self.anx_ind = add_index_points(
+            self.anx_ind, self.risk_in_top_up(amount, context)
+        )
         recent_cross_border_payment = any(
             is_within_window(
                 account.last_big_cross_boarder_pay,
@@ -281,7 +398,9 @@ class Account:
             for account in data_of_acc.get(self.id, [])
         )
         if self.is_indiv and is_tokenize and recent_cross_border_payment:
-            self.susp_ind += self.drop_risk_in_top_up(amount)
+            self.susp_ind = add_index_points(
+                self.susp_ind, self.drop_risk_in_top_up()
+            )
         if self.anx_ind >= risk_threshold:
             self.record_operation("cash_deposit", amount, context, status="blocked")
             raise BankException("возможно, клиент обманут")
@@ -299,8 +418,11 @@ class Account:
         merchant_id: int,
         context: OperationContext,
     ) -> int:
-    # При реализации сравнивайте покупку с self.operation_history
-        raise NotImplementedError
+        flags_score = score_flags(risk_flags, CARD_WEIGHTS)
+        amount_score = self._amount_anomaly_points(
+            "card_purchase", amount, context, peer_id=merchant_id
+        )
+        return min(MAX_INDEX, flags_score + amount_score)
 
 
     def card_purchase(
@@ -331,7 +453,7 @@ class Account:
             context.payment_network_risk,
         ]
         risk = self.risk_of_card_purchase(risk_flags, amount, merchant_id, context)
-        self.anx_ind += risk
+        self.anx_ind = add_index_points(self.anx_ind, risk)
         if self.anx_ind >= risk_threshold:
             self.record_operation(
                 "card_purchase", amount, context, merchant_id, status="blocked"
@@ -389,5 +511,10 @@ class Account:
 def end_of_the_day_for_all() -> None:
     for account in chain.from_iterable(data_of_acc.values()):
         account.end_of_the_day()
-    data_of_operations.clear() 
+    data_of_operations.clear()
+
+
+
+
+ 
       
